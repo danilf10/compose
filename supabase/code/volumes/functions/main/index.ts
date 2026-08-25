@@ -1,168 +1,153 @@
+// =============================================================================
+// Router principal de Edge Functions — AnaliCRM self-hosted
+// =============================================================================
+// Sustituye a volumes/functions/main/index.ts del template de Easypanel
+// (easypanel-io/compose, rama 18-05-2026, supabase/code).
+//
+// POR QUE SE SUSTITUYE
+//
+// El router original aplica UNA politica global de JWT a todas las funciones,
+// leyendo la variable VERIFY_JWT. En Supabase Cloud, en cambio, cada funcion
+// tiene su propio `verify_jwt`. Con una politica unica el sistema se rompe en
+// las dos direcciones:
+//
+//   VERIFY_JWT=true   -> Meta no puede entregar leads (llama sin JWT) y la
+//                        clasificacion IA del frontend deja de funcionar
+//                        (src/lib/groq.js llama a ai-classify sin cabeceras)
+//   VERIFY_JWT=false  -> las funciones admin-* quedan accesibles a cualquiera
+//                        que conozca la URL
+//
+// Este router replica el comportamiento del cloud: JWT obligatorio salvo en las
+// funciones declaradas publicas. Conserva la verificacion hibrida del original
+// (HS256 con JWT_SECRET para claves legacy, ES256/RS256 via JWKS para las
+// nuevas), asi que sigue valiendo si algun dia rotas al sistema de claves nuevo.
+//
+// La variable VERIFY_JWT del compose deja de usarse: manda PUBLIC_FUNCTIONS.
+// =============================================================================
+
 import * as jose from 'https://deno.land/x/jose@v4.14.4/index.ts'
 
-console.log('main function started')
+declare const EdgeRuntime: {
+  userWorkers: {
+    create(opts: Record<string, unknown>): Promise<{ fetch(req: Request): Promise<Response> }>
+  }
+}
 
-const JWT_SECRET = Deno.env.get('JWT_SECRET')
-const SUPABASE_URL = Deno.env.get('SUPABASE_URL')
-const VERIFY_JWT = Deno.env.get('VERIFY_JWT') === 'true'
+// --- Funciones publicas (sin JWT) --------------------------------------------
+// Configurable con PUBLIC_FUNCTIONS="a,b,c" en las variables del servicio.
+// Los valores por defecto salen de como las llama el sistema hoy:
+//   meta-leads-webhook -> lo invoca Meta: GET de verificacion + POST de leads
+//   web-leads-webhook  -> lo invocan las webs de los clientes con ?key=<token>
+//   ai-classify        -> lo llama el frontend sin cabecera Authorization
+const DEFAULT_PUBLIC = ['meta-leads-webhook', 'web-leads-webhook', 'ai-classify']
 
-// Create JWKS for ES256/RS256 tokens (newer tokens)
-let SUPABASE_JWT_KEYS: ReturnType<typeof jose.createRemoteJWKSet> | null = null
-if (SUPABASE_URL) {
-  try {
-    SUPABASE_JWT_KEYS = jose.createRemoteJWKSet(
-      new URL('/auth/v1/.well-known/jwks.json', SUPABASE_URL)
+const fromEnv = (Deno.env.get('PUBLIC_FUNCTIONS') ?? '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean)
+
+const PUBLIC_FUNCTIONS = new Set(fromEnv.length > 0 ? fromEnv : DEFAULT_PUBLIC)
+
+// --- Claves de verificacion ---------------------------------------------------
+const JWT_SECRET =
+  Deno.env.get('SUPABASE_INTERNAL_JWT_SECRET') ?? Deno.env.get('JWT_SECRET') ?? ''
+
+const HS_KEY = JWT_SECRET ? new TextEncoder().encode(JWT_SECRET) : null
+
+// JWKS para tokens asimetricos (ES256/RS256). Se resuelve de forma perezosa:
+// si el proyecto solo usa claves legacy HS256, nunca se llega a pedir.
+const SUPABASE_URL = Deno.env.get('SUPABASE_URL') ?? ''
+let jwks: ReturnType<typeof jose.createRemoteJWKSet> | null = null
+function getJWKS() {
+  if (!jwks && SUPABASE_URL) {
+    jwks = jose.createRemoteJWKSet(
+      new URL(`${SUPABASE_URL}/auth/v1/.well-known/jwks.json`),
     )
-  } catch (e) {
-    console.error('Failed to fetch JWKS from SUPABASE_URL:', e)
   }
+  return jwks
 }
 
-/**
- * Extract JWT token from Authorization header
- * 
- * Parses the Authorization header to extract the Bearer token.
- * Expects format: "Bearer <token>"
- * 
- * @param req - The HTTP request object
- * @returns The JWT token string
- * @throws Error if Authorization header is missing or malformed
- */
-function getAuthToken(req: Request) {
-  const authHeader = req.headers.get('authorization')
-  if (!authHeader) {
-    throw new Error('Missing authorization header')
-  }
-  const [bearer, token] = authHeader.split(' ')
-  if (bearer !== 'Bearer') {
-    throw new Error(`Auth header is not 'Bearer {token}'`)
-  }
-  return token
+console.log(
+  `[main] router AnaliCRM | publicas: ${[...PUBLIC_FUNCTIONS].join(', ')} | ` +
+    `HS256: ${HS_KEY ? 'ok' : 'SIN JWT_SECRET'} | JWKS: ${SUPABASE_URL ? 'ok' : 'sin SUPABASE_URL'}`,
+)
+
+function json(body: unknown, status: number): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  })
 }
 
-async function isValidLegacyJWT(jwt: string): Promise<boolean> {
-  if (!JWT_SECRET) {
-    console.error('JWT_SECRET not available for HS256 token verification')
-    return false
-  }
+function extractToken(req: Request): string | null {
+  const auth = req.headers.get('authorization')
+  if (auth && auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim()
+  return req.headers.get('apikey')
+}
 
-  const encoder = new TextEncoder();
-  const secretKey = encoder.encode(JWT_SECRET)
-
+// Verificacion hibrida: el algoritmo del token decide el metodo.
+// Mezclarlos da el error "Key for the ES256 algorithm must be of type CryptoKey".
+async function isValidJWT(token: string): Promise<boolean> {
   try {
-    await jose.jwtVerify(jwt, secretKey);
-  } catch (e) {
-    console.error('Symmetric Legacy JWT verification error', e);
-    return false;
-  }
-  return true;
-}
+    const { alg } = jose.decodeProtectedHeader(token)
 
-async function isValidJWT(jwt: string): Promise<boolean> {
-  if (!SUPABASE_JWT_KEYS) {
-    console.error('JWKS not available for ES256/RS256 token verification')
+    if (alg === 'HS256') {
+      if (!HS_KEY) return false
+      await jose.jwtVerify(token, HS_KEY)
+      return true
+    }
+
+    const keySet = getJWKS()
+    if (!keySet) return false
+    await jose.jwtVerify(token, keySet)
+    return true
+  } catch (_e) {
     return false
   }
-
-  try {
-    await jose.jwtVerify(jwt, SUPABASE_JWT_KEYS)
-  } catch (e) {
-    console.error('Asymmetric JWT verification error', e);
-    return false
-  }
-
-  return true;
 }
 
-/**
- * Verify JWT token, handling both legacy (HS256) and newer (ES256/RS256) algorithms
- * 
- * This function automatically detects the algorithm used in the token and applies
- * the appropriate verification method:
- * - HS256: Uses JWT_SECRET (symmetric key)
- * - ES256/RS256: Uses JWKS endpoint (asymmetric public keys)
- * 
- * This fix ensures compatibility with both legacy tokens and newer asymmetric tokens,
- * resolving the "Key for the ES256 algorithm must be of type CryptoKey" error.
- * 
- * @param jwt - The JWT token string to verify
- * @returns Promise resolving to true if verification succeeds, false otherwise
- */
-async function isValidHybridJWT(jwt: string): Promise<boolean> {
-  const { alg: jwtAlgorithm } = jose.decodeProtectedHeader(jwt)
+const handler = async (req: Request): Promise<Response> => {
+  const url = new URL(req.url)
+  const functionName = url.pathname.split('/').filter(Boolean)[0]
 
-  if (jwtAlgorithm === 'HS256') {
-    console.log(`Legacy token type detected, attempting ${jwtAlgorithm} verification.`)
-
-    return await isValidLegacyJWT(jwt)
+  if (!functionName) {
+    return json({ msg: 'falta el nombre de la funcion en la ruta' }, 400)
   }
 
-  if (jwtAlgorithm === 'ES256' || jwtAlgorithm === 'RS256') {
-    return await isValidJWT(jwt)
-  }
+  // El preflight CORS nunca lleva credenciales: se delega en la funcion, que es
+  // la que responde con sus propias cabeceras Access-Control-*.
+  const isPreflight = req.method === 'OPTIONS'
+  const isPublic = PUBLIC_FUNCTIONS.has(functionName)
 
-  return false;
-}
-
-Deno.serve(async (req: Request) => {
-  if (req.method !== 'OPTIONS' && VERIFY_JWT) {
-    try {
-      const token = getAuthToken(req)
-      const isValidJWT = await isValidHybridJWT(token);
-
-      if (!isValidJWT) {
-        return new Response(JSON.stringify({ msg: 'Invalid JWT' }), {
-          status: 401,
-          headers: { 'Content-Type': 'application/json' },
-        })
-      }
-    } catch (e) {
-      console.error(e)
-      return new Response(JSON.stringify({ msg: e.toString() }), {
-        status: 401,
-        headers: { 'Content-Type': 'application/json' },
-      })
+  if (!isPreflight && !isPublic) {
+    const token = extractToken(req)
+    if (!token || !(await isValidJWT(token))) {
+      console.log(`[main] 401 en ${functionName} (token ausente o invalido)`)
+      return json({ msg: 'Invalid JWT' }, 401)
     }
   }
 
-  const url = new URL(req.url)
-  const { pathname } = url
-  const path_parts = pathname.split('/')
-  const service_name = path_parts[1]
-
-  if (!service_name || service_name === '') {
-    const error = { msg: 'missing function name in request' }
-    return new Response(JSON.stringify(error), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    })
-  }
-
-  const servicePath = `/home/deno/functions/${service_name}`
-  console.error(`serving the request with ${servicePath}`)
-
-  const memoryLimitMb = 150
-  const workerTimeoutMs = 1 * 60 * 1000
-  const noModuleCache = false
-  const importMapPath = null
   const envVarsObj = Deno.env.toObject()
   const envVars = Object.keys(envVarsObj).map((k) => [k, envVarsObj[k]])
 
   try {
+    // Mismos limites que el router original del template
     const worker = await EdgeRuntime.userWorkers.create({
-      servicePath,
-      memoryLimitMb,
-      workerTimeoutMs,
-      noModuleCache,
-      importMapPath,
+      servicePath: `/home/deno/functions/${functionName}`,
+      memoryLimitMb: Number(Deno.env.get('EDGE_MEMORY_LIMIT_MB') ?? 150),
+      workerTimeoutMs: Number(Deno.env.get('EDGE_TIMEOUT_MS') ?? 60_000),
+      noModuleCache: false,
+      importMapPath: null,
       envVars,
     })
     return await worker.fetch(req)
   } catch (e) {
-    const error = { msg: e.toString() }
-    return new Response(JSON.stringify(error), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    })
+    console.error(`[main] error ejecutando ${functionName}:`, e)
+    return json(
+      { msg: `no se pudo ejecutar la funcion '${functionName}'`, detail: String(e) },
+      500,
+    )
   }
-})
+}
+
+Deno.serve(handler)
