@@ -582,25 +582,51 @@ services:
         echo "[backup] servicio iniciado; cada $${INTERVAL_SECONDS}s, conservando $${RETAIN_DAYS} dias"
         while true; do
           TS=$$(date -u +%Y%m%d-%H%M%S)
-          F="/backups/analicrm-$${TS}.sql.gz"
-          echo "[backup] $${TS} volcando..."
-          if pg_dumpall --clean --if-exists | gzip -9 > "$$F"; then
-            SIZE=$$(stat -c%s "$$F" 2>/dev/null || echo 0)
-            if [ "$$SIZE" -lt "$${MIN_BYTES}" ]; then
-              echo "[backup] ERROR: solo $$SIZE bytes, se descarta"
-              rm -f "$$F"
+
+          # --- 1. Volcado de aplicacion -------------------------------------
+          # El que se restaura en el dia a dia. Contiene el esquema public
+          # completo (tablas, RLS, funciones, triggers, vistas) y los usuarios
+          # de auth. Entra limpio sobre un Supabase que ya este funcionando,
+          # que es el caso normal: se rompe algo, se repone encima.
+          #
+          # auth.users va con --column-inserts para que no importe si la
+          # version de GoTrue de destino tiene columnas distintas.
+          APP="/backups/analicrm-$${TS}-app.sql.gz"
+          if { pg_dump --schema=public --no-owner --clean --if-exists; \
+               pg_dump --data-only --column-inserts -t auth.users -t auth.identities; } \
+             | gzip -9 > "$$APP"; then
+            SZ=$$(stat -c%s "$$APP" 2>/dev/null || echo 0)
+            if [ "$$SZ" -lt "$${MIN_BYTES}" ]; then
+              echo "[backup] ERROR app: solo $$SZ bytes, se descarta"; rm -f "$$APP"
             else
-              echo "[backup] OK $$F ($$SIZE bytes)"
+              echo "[backup] OK app      $$APP ($$SZ bytes)"
             fi
           else
-            echo "[backup] ERROR: fallo pg_dumpall"
-            rm -f "$$F"
+            echo "[backup] ERROR: fallo el volcado de aplicacion"; rm -f "$$APP"
           fi
+
+          # --- 2. Volcado completo del cluster ------------------------------
+          # Roles, las tres bases de datos y todo lo demas. No se restaura
+          # limpio sobre un Supabase ya inicializado (sus esquemas auth y
+          # storage chocan con los del volcado), pero es la copia de
+          # referencia: sirve para inspeccionar, para sacar datos sueltos y
+          # para reconstruir un cluster desde cero.
+          FULL="/backups/analicrm-$${TS}-completo.sql.gz"
+          if pg_dumpall --clean --if-exists | gzip -9 > "$$FULL"; then
+            SZ=$$(stat -c%s "$$FULL" 2>/dev/null || echo 0)
+            if [ "$$SZ" -lt "$${MIN_BYTES}" ]; then
+              echo "[backup] ERROR completo: solo $$SZ bytes, se descarta"; rm -f "$$FULL"
+            else
+              echo "[backup] OK completo $$FULL ($$SZ bytes)"
+            fi
+          else
+            echo "[backup] ERROR: fallo pg_dumpall"; rm -f "$$FULL"
+          fi
+
           find /backups -name 'analicrm-*.sql.gz' -mtime +$${RETAIN_DAYS} -delete 2>/dev/null || true
           echo "[backup] copias actuales: $$(ls -1 /backups/analicrm-*.sql.gz 2>/dev/null | wc -l)"
           sleep $${INTERVAL_SECONDS}
         done
-
   vector:
     image: timberio/vector:0.53.0-alpine
     restart: unless-stopped
