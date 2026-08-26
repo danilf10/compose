@@ -421,7 +421,13 @@ services:
     image: supabase/edge-runtime:v1.71.2
     restart: unless-stopped
     volumes:
-      - ./volumes/functions:/home/deno/functions:Z
+      # Se monta functions2 y no functions a proposito. Easypanel copia el
+      # contenido de volumes/ al host solo la primera vez y despues no
+      # sobrescribe los ficheros que ya existen (asi preserva volumes/db, donde
+      # vive la base de datos). Consecuencia: cambiar el codigo de una funcion
+      # ya desplegada no surtia efecto. Al apuntar a una carpeta nueva, si se
+      # copia. La anterior se queda en el host sin usar; se puede borrar a mano.
+      - ./volumes/functions2:/home/deno/functions:Z
       - deno-cache:/root/.cache/deno
     depends_on:
       kong:
