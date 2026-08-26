@@ -529,6 +529,73 @@ services:
         "log_min_messages=fatal" # prevents Realtime polling queries from appearing in logs
       ]
 
+  # ---------------------------------------------------------------------------
+  # Copias de seguridad de la base de datos
+  # ---------------------------------------------------------------------------
+  # Supabase Cloud hacia backups automaticos; el self-hosted no trae ninguno.
+  # Este servicio vuelca la base entera una vez al dia y rota los antiguos.
+  #
+  # Va dentro del propio stack a proposito: comparte la red interna con `db`,
+  # asi que no hace falta exponer Postgres al exterior ni duplicar credenciales.
+  # Reutiliza las mismas variables que ya usan los demas servicios.
+  #
+  # Los ficheros quedan en ./volumes/backups del host.
+  #
+  # LIMITACION: un backup en la misma maquina que la base de datos protege de
+  # un borrado accidental, de una corrupcion o de una migracion mal hecha, pero
+  # no de perder la maquina. La copia fuera del servidor es un paso aparte.
+  #
+  # Restaurar:
+  #   gunzip -c volumes/backups/analicrm-FECHA.sql.gz | docker exec -i <db> psql -U postgres
+  backup:
+    container_name: supabase-backup
+    image: postgres:15-alpine
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGPORT: ${POSTGRES_PORT}
+      PGUSER: postgres
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB}
+      # Dias que se conservan los volcados
+      RETAIN_DAYS: ${BACKUP_RETAIN_DAYS:-14}
+      # Cada cuanto se repite, en segundos (86400 = 24 h)
+      INTERVAL_SECONDS: ${BACKUP_INTERVAL_SECONDS:-86400}
+      # Tamano minimo aceptable en bytes. Un volcado de 0 bytes es un backup
+      # roto que pasa desapercibido durante meses; mejor descartarlo y gritar.
+      MIN_BYTES: ${BACKUP_MIN_BYTES:-10240}
+    volumes:
+      - ./volumes/backups:/backups:Z
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -u
+        echo "[backup] servicio iniciado; cada $${INTERVAL_SECONDS}s, conservando $${RETAIN_DAYS} dias"
+        while true; do
+          TS=$$(date -u +%Y%m%d-%H%M%S)
+          F="/backups/analicrm-$${TS}.sql.gz"
+          echo "[backup] $${TS} volcando..."
+          if pg_dumpall --clean --if-exists | gzip -9 > "$$F"; then
+            SIZE=$$(stat -c%s "$$F" 2>/dev/null || echo 0)
+            if [ "$$SIZE" -lt "$${MIN_BYTES}" ]; then
+              echo "[backup] ERROR: solo $$SIZE bytes, se descarta"
+              rm -f "$$F"
+            else
+              echo "[backup] OK $$F ($$SIZE bytes)"
+            fi
+          else
+            echo "[backup] ERROR: fallo pg_dumpall"
+            rm -f "$$F"
+          fi
+          find /backups -name 'analicrm-*.sql.gz' -mtime +$${RETAIN_DAYS} -delete 2>/dev/null || true
+          echo "[backup] copias actuales: $$(ls -1 /backups/analicrm-*.sql.gz 2>/dev/null | wc -l)"
+          sleep $${INTERVAL_SECONDS}
+        done
+
   vector:
     image: timberio/vector:0.53.0-alpine
     restart: unless-stopped
