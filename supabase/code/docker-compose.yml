@@ -554,7 +554,6 @@ services:
   # Restaurar:
   #   gunzip -c volumes/backups/analicrm-FECHA.sql.gz | docker exec -i <db> psql -U postgres
   backup:
-    container_name: supabase-backup
     image: postgres:15-alpine
     restart: unless-stopped
     depends_on:
