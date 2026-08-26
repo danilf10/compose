@@ -592,8 +592,15 @@ services:
           # auth.users va con --column-inserts para que no importe si la
           # version de GoTrue de destino tiene columnas distintas.
           APP="/backups/analicrm-$${TS}-app.sql.gz"
-          if { pg_dump --schema=public --no-owner --clean --if-exists; \
-               pg_dump --data-only --column-inserts -t auth.users -t auth.identities; } \
+          # Los usuarios PRIMERO: profiles, leads.assigned_to y
+          # lead_comments.author_id apuntan a auth.users, y sus claves
+          # ajenas no se pueden crear si los usuarios no estan cargados.
+          #
+          # --no-owner en los dos: sin el, pg_dump emite instrucciones de
+          # propiedad que exigen ser miembro de supabase_admin, y este
+          # volcado corre como postgres, que en Supabase no lo es.
+          if { pg_dump --data-only --column-inserts --no-owner -t auth.users -t auth.identities; \
+               pg_dump --schema=public --no-owner --clean --if-exists; } \
              | gzip -9 > "$$APP"; then
             SZ=$$(stat -c%s "$$APP" 2>/dev/null || echo 0)
             if [ "$$SZ" -lt "$${MIN_BYTES}" ]; then
