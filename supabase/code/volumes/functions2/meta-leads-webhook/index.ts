@@ -62,83 +62,163 @@ function extractField(fieldData, candidates) {
   }
   return null;
 }
+// Cuantos servicios puede llegar a crear la IA sola. No es un limite de
+// negocio: es una red por si algo se descontrola y empieza a inventar uno por
+// lead. A partir de ahi clasifica con los que hay, pero no anade mas.
+const MAX_SERVICIOS_AUTO = 25;
+// Para comparar "Reforma integral" con "reformas integrales " y ver que son lo
+// mismo antes de crear un duplicado.
+function normalizar(s) {
+  return String(s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+}
+function mismoServicio(a, b) {
+  const na = normalizar(a), nb = normalizar(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  // plurales y pequenas variantes: "reforma integral" / "reformas integrales"
+  const raiz = (x)=>x.split(" ").map((p)=>p.replace(/(es|s)$/, "")).join(" ");
+  return raiz(na) === raiz(nb);
+}
+// Un nombre de servicio es una etiqueta corta, no una frase. Sirve para
+// descartar respuestas como "El cliente quiere que le cambien la bañera".
+function nombreRazonable(s) {
+  const limpio = String(s || "").trim();
+  if (limpio.length < 3 || limpio.length > 40) return false;
+  const palabras = limpio.split(/\s+/);
+  if (palabras.length > 4) return false;
+  if (/[.:;!?\n]/.test(limpio)) return false;
+  return /[a-zA-ZáéíóúüñÁÉÍÓÚÜÑ]/.test(limpio);
+}
+function extraerJson(texto) {
+  if (!texto) return null;
+  const i = texto.indexOf("{"), j = texto.lastIndexOf("}");
+  if (i === -1 || j === -1 || j < i) return null;
+  try {
+    return JSON.parse(texto.slice(i, j + 1));
+  } catch  {
+    return null;
+  }
+}
+// Devuelve { servicio, isNew }. servicio es siempre uno de los de la empresa, o
+// uno nuevo que ha pasado el filtro, o null. Nunca una frase suelta: si el lead
+// no deja claro que quiere, se queda sin clasificar y lo decide una persona.
 async function classifyService(datosRaw, services, contextoIa, groqKey) {
   const customFields = {};
   for (const [k, v] of Object.entries(datosRaw)){
-    const kLower = k.toLowerCase().replace(/[¿?]/g, "").trim();
-    if (!SKIP_FIELDS.some((sf)=>kLower.includes(sf) || sf.includes(kLower)) && v) customFields[k] = v;
+    const kLower = String(k).toLowerCase().replace(/[¿?]/g, "").trim();
+    const esContacto = SKIP_FIELDS.some((sf)=>kLower === sf || kLower.includes(sf) || sf.includes(kLower));
+    if (!esContacto && v && typeof v === "string") customFields[k] = v;
   }
   if (Object.keys(customFields).length === 0) return {
     servicio: null,
     isNew: false
   };
+  // Antes de gastar una llamada: si el propio formulario ya trae el nombre de
+  // un servicio que existe, no hay nada que pensar.
   for (const val of Object.values(customFields)){
-    const match = services.find((s)=>s.toLowerCase().trim() === val.toLowerCase().trim());
+    const match = services.find((s)=>mismoServicio(s, val));
     if (match) return {
       servicio: match,
       isNew: false
     };
   }
   for (const val of Object.values(customFields)){
-    const valLower = val.toLowerCase();
-    const match = services.find((s)=>s.toLowerCase().includes(valLower) || valLower.includes(s.toLowerCase()));
+    const valLower = normalizar(val);
+    const match = services.find((s)=>{
+      const ns = normalizar(s);
+      return ns && valLower && (ns.includes(valLower) || valLower.includes(ns));
+    });
     if (match) return {
       servicio: match,
       isNew: false
     };
   }
-  if (groqKey) {
-    try {
-      const prompt = `Eres un asistente que clasifica leads.\n\n${contextoIa ? `CONTEXTO:\n${contextoIa}\n\n` : ""}SERVICIOS: ${services.length > 0 ? JSON.stringify(services) : "(ninguno)"}\n\nDATOS:\n${Object.entries(customFields).map(([k, v])=>`- ${k}: ${v}`).join("\n")}\n\nResponde SOLO con el nombre del servicio.`;
-      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${groqKey}`
-        },
-        body: JSON.stringify({
-          model: "openai/gpt-oss-120b",
-          messages: [
-            {
-              role: "user",
-              content: prompt
-            }
-          ],
-          temperature: 0.1,
-          // gpt-oss-120b razona antes de responder, y ese razonamiento consume
-          // tokens de la misma cuenta. Con 50 se agotaban razonando: la
-          // respuesta llegaba vacia con finish_reason "length" y el lead se
-          // quedaba sin clasificar, sin ningun error visible. Con esfuerzo bajo
-          // resuelve en unos 60 tokens; 512 deja margen de sobra.
-          reasoning_effort: "low",
-          max_tokens: 512
-        })
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const answer = data.choices?.[0]?.message?.content?.trim();
-        if (answer) {
-          const existingMatch = services.find((s)=>s.toLowerCase() === answer.toLowerCase());
-          return existingMatch ? {
-            servicio: existingMatch,
-            isNew: false
-          } : {
-            servicio: answer,
-            isNew: true
-          };
-        }
-      }
-    } catch  {}
-  }
-  const vals = Object.values(customFields);
-  if (vals.length === 1) return {
-    servicio: vals[0],
-    isNew: !services.some((s)=>s.toLowerCase() === vals[0].toLowerCase())
-  };
-  return {
+  if (!groqKey) return {
     servicio: null,
     isNew: false
   };
+  const puedeCrear = services.length < MAX_SERVICIOS_AUTO;
+  try {
+    const reglas = [
+      "- Si encaja en uno de los SERVICIOS, responde ese nombre EXACTO y nuevo=false.",
+      puedeCrear ? "- Si ninguno encaja pero el lead dice con claridad que necesita, propon un nombre nuevo, corto (1 a 3 palabras), generico y en singular, y nuevo=true." : "- No propongas servicios nuevos: usa solo los de la lista.",
+      '- Si no esta claro que quiere, responde servicio "" y seguridad "baja". Es preferible dejarlo sin clasificar a acertar por casualidad.',
+      '- seguridad es "alta" solo si el propio lead dice lo que necesita, no si lo deduces por contexto.'
+    ].join("\n");
+    const prompt = `Eres un asistente que clasifica leads.
+
+${contextoIa ? `CONTEXTO:\n${contextoIa}\n\n` : ""}SERVICIOS: ${services.length > 0 ? JSON.stringify(services) : "(ninguno todavia)"}
+
+DATOS DEL LEAD:
+${Object.entries(customFields).map(([k, v])=>`- ${k}: ${v}`).join("\n")}
+
+REGLAS:
+${reglas}
+
+Responde SOLO con JSON, sin nada mas:
+{"servicio": "<nombre o vacio>", "nuevo": true|false, "seguridad": "alta"|"media"|"baja"}`;
+    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${groqKey}`
+      },
+      body: JSON.stringify({
+        model: "openai/gpt-oss-120b",
+        messages: [
+          {
+            role: "user",
+            content: prompt
+          }
+        ],
+        temperature: 0.1,
+        // gpt-oss-120b razona antes de responder y ese razonamiento gasta
+        // tokens de la misma cuenta. Con 50 se los gastaba pensando y devolvia
+        // el contenido vacio: el lead se quedaba sin clasificar y sin error.
+        reasoning_effort: "low",
+        max_tokens: 512,
+        response_format: {
+          type: "json_object"
+        }
+      })
+    });
+    if (!res.ok) return {
+      servicio: null,
+      isNew: false
+    };
+    const data = await res.json();
+    const parsed = extraerJson(data.choices?.[0]?.message?.content?.trim());
+    const propuesto = parsed?.servicio?.trim();
+    if (!propuesto) return {
+      servicio: null,
+      isNew: false
+    };
+    // Aunque diga que es nuevo, si ya existe algo equivalente se usa lo que hay.
+    const existente = services.find((s)=>mismoServicio(s, propuesto));
+    if (existente) return {
+      servicio: existente,
+      isNew: false
+    };
+    // A partir de aqui seria crear uno. Solo si se puede, si la IA lo tiene
+    // claro y si el nombre parece una etiqueta y no una frase.
+    if (!puedeCrear || parsed?.seguridad !== "alta" || !nombreRazonable(propuesto)) {
+      return {
+        servicio: null,
+        isNew: false
+      };
+    }
+    // Con inicial en mayuscula: esta lista se ve en la configuracion de la
+    // empresa junto a los servicios que ha escrito una persona.
+    return {
+      servicio: propuesto.charAt(0).toUpperCase() + propuesto.slice(1),
+      isNew: true
+    };
+  } catch  {
+    return {
+      servicio: null,
+      isNew: false
+    };
+  }
 }
 async function fetchFormRow(supabase, formId) {
   const { data } = await supabase.from("meta_lead_forms_decrypted").select("company_id, page_access_token, form_name, default_servicio, active, excluded").eq("meta_form_id", formId).maybeSingle();
