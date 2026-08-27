@@ -14,8 +14,28 @@ Deno.serve(async (req)=>{
   });
   try {
     const supabase = createClient(Deno.env.get("SUPABASE_URL"), Deno.env.get("SUPABASE_SERVICE_ROLE_KEY"));
-    // Rate limiting
-    const ip = req.headers.get("x-forwarded-for") || "unknown";
+    // Esta funcion gasta la cuenta de Groq, asi que no puede estar abierta:
+    // sin esto, cualquiera que viera una peticion en su navegador podia
+    // repetirla en bucle y agotar la cuota, dejando sin clasificar los leads
+    // de los clientes de verdad.
+    const auth = req.headers.get("authorization") || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
+    if (authErr || !user) {
+      return new Response(JSON.stringify({
+        error: "No autorizado"
+      }), {
+        status: 401,
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "application/json"
+        }
+      });
+    }
+    // El limite va por usuario, no por IP: la IP salia de x-forwarded-for, una
+    // cabecera que envia el propio cliente, asi que bastaba con cambiarla en
+    // cada peticion para saltarse el limite.
+    const ip = user.id;
     const windowStart = new Date(Date.now() - 60000).toISOString();
     const { count } = await supabase.from("rate_limits").select("*", {
       count: "exact",

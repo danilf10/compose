@@ -69,6 +69,41 @@ Deno.serve(async (req)=>{
       }, 200);
     }
     const supabase = createClient(Deno.env.get("SUPABASE_URL"), Deno.env.get("SUPABASE_SERVICE_ROLE_KEY"));
+
+    // Esta funcion escribe en la cuenta de Facebook del cliente: marca el lead
+    // como ganado o perdido, y eso alimenta la optimizacion de sus campanas.
+    // Sin las dos comprobaciones de aqui abajo la aceptaba cualquiera, incluso
+    // sin sesion, con solo acertar un identificador de lead.
+    const auth = req.headers.get("authorization") || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+    const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
+    if (authErr || !user) {
+      console.log(`${LOG} sin sesion valida`);
+      return json({
+        error: "No autorizado"
+      }, 401);
+    }
+
+    // Y que el lead sea de su empresa. El superadmin puede con todos.
+    const { data: perfil } = await supabase.from("profiles")
+      .select("company_id, role").eq("id", user.id).single();
+    const { data: lead } = await supabase.from("leads")
+      .select("company_id").eq("id", lead_id).single();
+    if (!lead) {
+      return json({
+        error: "Lead no encontrado"
+      }, 404);
+    }
+    if (perfil?.role !== "superadmin" && lead.company_id !== perfil?.company_id) {
+      console.log(`${LOG} lead de otra empresa:`, {
+        lead_id,
+        usuario: user.id
+      });
+      return json({
+        error: "No autorizado"
+      }, 403);
+    }
+
     // 1. Resolver meta_lead_id y form_id desde el sidecar
     const { data: meta, error: metaErr } = await supabase.from("lead_meta_facebook").select("meta_lead_id, form_id").eq("lead_id", lead_id).single();
     if (metaErr || !meta?.meta_lead_id) {
