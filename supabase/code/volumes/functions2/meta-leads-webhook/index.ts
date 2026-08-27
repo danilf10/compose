@@ -102,7 +102,7 @@ function extraerJson(texto) {
 // Devuelve { servicio, isNew }. servicio es siempre uno de los de la empresa, o
 // uno nuevo que ha pasado el filtro, o null. Nunca una frase suelta: si el lead
 // no deja claro que quiere, se queda sin clasificar y lo decide una persona.
-async function classifyService(datosRaw, services, contextoIa, groqKey) {
+async function classifyService(datosRaw, services, contextoIa, groqKey, permitirCrear = true) {
   const customFields = {};
   for (const [k, v] of Object.entries(datosRaw)){
     const kLower = String(k).toLowerCase().replace(/[¿?]/g, "").trim();
@@ -137,7 +137,9 @@ async function classifyService(datosRaw, services, contextoIa, groqKey) {
     servicio: null,
     isNew: false
   };
-  const puedeCrear = services.length < MAX_SERVICIOS_AUTO;
+  // Tres cosas tienen que darse para crear: que la empresa lo permita en su
+  // configuracion, que no se haya llegado al tope, y que la IA lo tenga claro.
+  const puedeCrear = permitirCrear && services.length < MAX_SERVICIOS_AUTO;
   try {
     const reglas = [
       "- Si encaja en uno de los SERVICIOS, responde ese nombre EXACTO y nuevo=false.",
@@ -368,7 +370,7 @@ async function processLead(leadgenId, formId, pageId, supabase, groqKey, ip, pay
   const defaultAssignee = company?.settings?.default_assignee || null;
   let servicio = default_servicio || null;
   if (!servicio) {
-    const classification = await classifyService(datosRaw, services, contextoIa, groqKey);
+    const classification = await classifyService(datosRaw, services, contextoIa, groqKey, company?.settings?.ia_crear_servicios !== false);
     servicio = classification.servicio;
     if (classification.isNew && servicio && company?.settings) {
       await supabase.from("companies").update({
