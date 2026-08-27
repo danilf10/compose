@@ -54,6 +54,83 @@ const SERVICE_FIELDS = [
   "tipo",
   "interes"
 ];
+// Los campos de contacto no dicen nada sobre que servicio quiere el lead. El
+// mensaje si, y mucho, asi que ese se queda.
+const CAMPOS_CONTACTO = [
+  ...NAME_FIELDS,
+  ...EMAIL_FIELDS,
+  ...PHONE_FIELDS
+];
+async function getSecret(supabase, key) {
+  const { data } = await supabase.rpc("get_secret", {
+    secret_key: key
+  });
+  return data || "";
+}
+// Mismo criterio que en el webhook de Facebook, para que un lead de la web y
+// uno de Facebook con los mismos datos acaben con el mismo servicio:
+// coincidencia exacta, luego parcial, y solo entonces se pregunta a la IA.
+async function clasificarServicio(datos, services, contextoIa, groqKey) {
+  const utiles = {};
+  for (const [k, v] of Object.entries(datos)){
+    const kLower = String(k).toLowerCase().replace(/[¿?]/g, "").trim();
+    const esContacto = CAMPOS_CONTACTO.some((cf)=>kLower === cf || kLower.includes(cf));
+    if (!esContacto && v && typeof v === "string") utiles[k] = v;
+  }
+  if (Object.keys(utiles).length === 0) return null;
+  for (const val of Object.values(utiles)){
+    const match = services.find((s)=>s.toLowerCase().trim() === val.toLowerCase().trim());
+    if (match) return match;
+  }
+  for (const val of Object.values(utiles)){
+    const valLower = val.toLowerCase();
+    const match = services.find((s)=>s.toLowerCase().includes(valLower) || valLower.includes(s.toLowerCase()));
+    if (match) return match;
+  }
+  if (!groqKey) return null;
+  try {
+    const prompt = `Eres un asistente que clasifica leads.
+
+${contextoIa ? `CONTEXTO:
+${contextoIa}
+
+` : ""}SERVICIOS: ${services.length > 0 ? JSON.stringify(services) : "(ninguno)"}
+
+DATOS:
+${Object.entries(utiles).map(([k, v])=>`- ${k}: ${v}`).join("\n")}
+
+Responde SOLO con el nombre del servicio.`;
+    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${groqKey}`
+      },
+      body: JSON.stringify({
+        model: "openai/gpt-oss-120b",
+        messages: [
+          {
+            role: "user",
+            content: prompt
+          }
+        ],
+        temperature: 0.1,
+        // Ver la nota del mismo sitio en meta-leads-webhook: con 50 tokens el
+        // modelo se los gasta razonando y devuelve la respuesta vacia.
+        reasoning_effort: "low",
+        max_tokens: 512
+      })
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const respuesta = data.choices?.[0]?.message?.content?.trim();
+    if (!respuesta) return null;
+    const existente = services.find((s)=>s.toLowerCase() === respuesta.toLowerCase());
+    return existente || respuesta;
+  } catch  {
+    return null;
+  }
+}
 function findField(data, candidates) {
   for (const key of candidates)if (data[key]) return data[key];
   const lowerData = {};
@@ -155,10 +232,31 @@ Deno.serve(async (req)=>{
   const email = findField(data, EMAIL_FIELDS);
   const telefono = findField(data, PHONE_FIELDS);
   const mensaje = findField(data, MESSAGE_FIELDS);
-  const servicio = findField(data, SERVICE_FIELDS);
+  let servicio = findField(data, SERVICE_FIELDS);
   const defaultAssignee = company.settings?.default_assignee || null;
   const datosRaw = {};
   for (const [k, v] of Object.entries(data))datosRaw[k] = v;
+  // Si el formulario no trae servicio, se deduce de lo que haya escrito el
+  // lead. Antes se quedaba sin clasificar y habia que hacerlo a mano uno a uno,
+  // que es justo lo que evita el webhook de Facebook desde el principio.
+  if (!servicio) {
+    const groqKey = await getSecret(supabase, "GROQ_API_KEY");
+    const services = company.settings?.services || [];
+    servicio = await clasificarServicio(datosRaw, services, company.settings?.contexto_ia || null, groqKey);
+    // Si la IA propone uno que no estaba, se anade a la empresa, igual que hace
+    // el webhook de Facebook.
+    if (servicio && !services.some((s)=>s.toLowerCase() === servicio.toLowerCase()) && company.settings) {
+      await supabase.from("companies").update({
+        settings: {
+          ...company.settings,
+          services: [
+            ...services,
+            servicio
+          ]
+        }
+      }).eq("id", company.id);
+    }
+  }
   const { data: insertedLead, error: insertErr } = await supabase.from("leads").insert({
     company_id: company.id,
     nombre,

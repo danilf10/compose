@@ -66,7 +66,13 @@ Deno.serve(async (req)=>{
             }
           ],
           temperature: 0.1,
-          max_tokens: 50
+          // gpt-oss-120b razona antes de responder, y ese razonamiento consume
+          // tokens de la misma cuenta. Con 50 se agotaban razonando: la
+          // respuesta llegaba vacia con finish_reason "length" y el lead se
+          // quedaba sin clasificar, sin ningun error visible. Con esfuerzo bajo
+          // resuelve en unos 60 tokens; 512 deja margen de sobra.
+          reasoning_effort: "low",
+          max_tokens: 512
         })
       });
       if (!res.ok) return new Response(JSON.stringify({
