@@ -105,8 +105,21 @@ Deno.serve(async (req)=>{
         }
       });
       const data = await res.json();
+      const contenido = data.choices?.[0]?.message?.content?.trim();
+      if (!contenido) {
+        console.error("respuesta vacia de la IA:", data.choices?.[0]?.finish_reason, data.usage);
+        return new Response(JSON.stringify({
+          error: "La IA no ha devuelto respuesta"
+        }), {
+          status: 502,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json"
+          }
+        });
+      }
       return new Response(JSON.stringify({
-        result: data.choices?.[0]?.message?.content?.trim()
+        result: contenido
       }), {
         headers: {
           ...corsHeaders,
@@ -125,7 +138,13 @@ Deno.serve(async (req)=>{
           model: "openai/gpt-oss-120b",
           messages,
           temperature: 0.3,
-          max_tokens: 2000
+          // Mismo motivo que en la clasificacion: el modelo razona antes de
+          // responder y ese razonamiento gasta del mismo saco. Al crecer el
+          // prompt -ahora lleva el indice del manual y la seccion que toque-
+          // se comia los 2000 pensando y devolvia contenido vacio, que el
+          // frontend enseñaba como "error al procesar tu pregunta".
+          reasoning_effort: "low",
+          max_tokens: 3000
         })
       });
       if (!res.ok) return new Response(JSON.stringify({
@@ -138,8 +157,21 @@ Deno.serve(async (req)=>{
         }
       });
       const data = await res.json();
+      const contenido = data.choices?.[0]?.message?.content?.trim();
+      if (!contenido) {
+        console.error("respuesta vacia de la IA:", data.choices?.[0]?.finish_reason, data.usage);
+        return new Response(JSON.stringify({
+          error: "La IA no ha devuelto respuesta"
+        }), {
+          status: 502,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json"
+          }
+        });
+      }
       return new Response(JSON.stringify({
-        result: data.choices?.[0]?.message?.content?.trim()
+        result: contenido
       }), {
         headers: {
           ...corsHeaders,
